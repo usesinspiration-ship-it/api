@@ -570,9 +570,18 @@ async function initializeDatabase() {
     try {
       await query(sqlWithForeignKey);
     } catch (error) {
+      const foreignKeyErrno = error?.errno ?? error?.originalError?.errno;
+      const combinedMessage = [
+        error?.message,
+        error?.details,
+        error?.originalError?.message,
+      ]
+        .filter(Boolean)
+        .join(' | ');
+
       const isForeignKeyCreateError =
         error?.code === 'ER_CANT_CREATE_TABLE' &&
-        /Foreign key constraint is incorrectly formed/i.test(error?.message || '');
+        (foreignKeyErrno === 1005 || /foreign key constraint is incorrectly formed/i.test(combinedMessage));
 
       if (!isForeignKeyCreateError) {
         throw error;
@@ -580,8 +589,8 @@ async function initializeDatabase() {
 
       logWarn('foreign key creation failed; retrying without foreign key', {
         code: error?.code,
-        errno: error?.errno,
-        message: error?.message,
+        errno: foreignKeyErrno,
+        message: combinedMessage,
       });
 
       await query(sqlWithoutForeignKey);
