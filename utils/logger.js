@@ -7,7 +7,7 @@ const { createStream } = require('rotating-file-stream');
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 const LOG_DIR = path.resolve(process.cwd(), process.env.LOG_DIR || './logs');
 const LOG_MAX_SIZE = process.env.LOG_MAX_SIZE || '10M';
-const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES || 30);
+const LOG_MAX_FILES = Math.max(1, Number.parseInt(process.env.LOG_MAX_FILES || '30', 10) || 30);
 const DEBUG_MODE = String(process.env.DEBUG || process.env.NODE_ENV === 'development').toLowerCase() === 'true';
 const LOG_EXTERNAL_WEBHOOK = process.env.LOG_EXTERNAL_WEBHOOK || '';
 
@@ -125,7 +125,7 @@ const rotatingStream = createStream((time) => {
   interval: '1d',
   path: LOG_DIR,
   size: LOG_MAX_SIZE,
-  maxFiles: `${LOG_MAX_FILES}d`,
+  maxFiles: LOG_MAX_FILES,
   compress: 'gzip',
 });
 
