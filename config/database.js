@@ -566,6 +566,28 @@ async function initializeDatabase() {
     }
   };
 
+  const runCreateWithForeignKeyFallback = async (sqlWithForeignKey, sqlWithoutForeignKey) => {
+    try {
+      await query(sqlWithForeignKey);
+    } catch (error) {
+      const isForeignKeyCreateError =
+        error?.code === 'ER_CANT_CREATE_TABLE' &&
+        /Foreign key constraint is incorrectly formed/i.test(error?.message || '');
+
+      if (!isForeignKeyCreateError) {
+        throw error;
+      }
+
+      logWarn('foreign key creation failed; retrying without foreign key', {
+        code: error?.code,
+        errno: error?.errno,
+        message: error?.message,
+      });
+
+      await query(sqlWithoutForeignKey);
+    }
+  };
+
   await query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -582,7 +604,8 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
-  await query(`
+  await runCreateWithForeignKeyFallback(
+    `
     CREATE TABLE IF NOT EXISTS user_refresh_tokens (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       user_id INT UNSIGNED NOT NULL,
@@ -602,9 +625,29 @@ async function initializeDatabase() {
         FOREIGN KEY (user_id) REFERENCES users(id)
         ON DELETE CASCADE ON UPDATE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
+  `,
+    `
+    CREATE TABLE IF NOT EXISTS user_refresh_tokens (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id INT UNSIGNED NOT NULL,
+      token_hash CHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      is_revoked TINYINT(1) NOT NULL DEFAULT 0,
+      revoked_at DATETIME NULL,
+      last_used_at DATETIME NULL,
+      user_agent VARCHAR(500) NULL,
+      ip_address VARCHAR(100) NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_user_refresh_token_hash (token_hash),
+      KEY idx_user_refresh_tokens_user_id (user_id),
+      KEY idx_user_refresh_tokens_expires_at (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `
+  );
 
-  await query(`
+  await runCreateWithForeignKeyFallback(
+    `
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       user_id INT UNSIGNED NOT NULL,
@@ -621,7 +664,23 @@ async function initializeDatabase() {
         FOREIGN KEY (user_id) REFERENCES users(id)
         ON DELETE CASCADE ON UPDATE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
+  `,
+    `
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id INT UNSIGNED NOT NULL,
+      token_hash CHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME NULL,
+      requested_ip VARCHAR(100) NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_password_reset_token_hash (token_hash),
+      KEY idx_password_reset_tokens_user_id (user_id),
+      KEY idx_password_reset_tokens_expires_at (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `
+  );
 
   await query(`
     CREATE TABLE IF NOT EXISTS auth_token_blacklist (
@@ -635,7 +694,8 @@ async function initializeDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
-  await query(`
+  await runCreateWithForeignKeyFallback(
+    `
     CREATE TABLE IF NOT EXISTS cvs (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       filename VARCHAR(255) NOT NULL,
@@ -663,7 +723,34 @@ async function initializeDatabase() {
         FOREIGN KEY (created_by) REFERENCES users(id)
         ON DELETE SET NULL ON UPDATE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
+  `,
+    `
+    CREATE TABLE IF NOT EXISTS cvs (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      filename VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NULL,
+      phone VARCHAR(50) NULL,
+      skills JSON NULL,
+      job_titles JSON NULL,
+      languages JSON NULL,
+      education VARCHAR(255) NULL,
+      experience_years INT NULL,
+      file_size BIGINT UNSIGNED NULL,
+      raw_content LONGTEXT NULL,
+      created_by INT UNSIGNED NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_cvs_filename (filename),
+      KEY idx_cvs_email (email),
+      KEY idx_cvs_phone (phone),
+      KEY idx_cvs_education (education),
+      KEY idx_cvs_experience_years (experience_years),
+      KEY idx_cvs_file_size (file_size),
+      KEY idx_cvs_updated_at (updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `
+  );
 
   await runSchemaQuery('ALTER TABLE cvs ADD COLUMN languages JSON NULL');
   await runSchemaQuery('ALTER TABLE cvs ADD COLUMN education VARCHAR(255) NULL');
