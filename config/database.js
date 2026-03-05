@@ -38,28 +38,57 @@ function isProduction() {
   return String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
 }
 
+function readEnvVar(key) {
+  const raw = process.env[key];
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  const value = String(raw).trim();
+  return value === '' ? undefined : value;
+}
+
 function envValue(baseKey, fallback) {
   const env = String(process.env.NODE_ENV || 'development').toLowerCase();
-  const envSpecific = process.env[`${baseKey}_${env.toUpperCase()}`];
-  const base = process.env[baseKey];
+  const envSpecific = readEnvVar(`${baseKey}_${env.toUpperCase()}`);
+  const base = readEnvVar(baseKey);
   return envSpecific ?? base ?? fallback;
 }
 
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function parseNumber(value, fallback) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
 function buildPoolConfig() {
-  const enableSSL = String(envValue('DB_SSL', 'false')).toLowerCase() === 'true';
+  const host = firstDefined(envValue('DB_HOST'), readEnvVar('MYSQLHOST'), 'localhost');
+  const port = parseNumber(firstDefined(envValue('DB_PORT'), readEnvVar('MYSQLPORT'), 3306), 3306);
+  const user = firstDefined(envValue('DB_USER'), readEnvVar('MYSQLUSER'), 'root');
+  const password = firstDefined(envValue('DB_PASS'), readEnvVar('MYSQLPASSWORD'), '');
+  const database = firstDefined(envValue('DB_NAME'), readEnvVar('MYSQLDATABASE'), 'cv_vault_db');
+  const enableSSL =
+    String(firstDefined(envValue('DB_SSL'), readEnvVar('MYSQL_SSL'), 'false')).toLowerCase() === 'true';
 
   return {
-    host: envValue('DB_HOST', 'localhost'),
-    port: Number(envValue('DB_PORT', 3306)),
-    user: envValue('DB_USER', 'root'),
-    password: envValue('DB_PASS', ''),
-    database: envValue('DB_NAME', 'cv_vault_db'),
+    host,
+    port,
+    user,
+    password,
+    database,
     waitForConnections: true,
-    connectionLimit: Math.max(1, Number(envValue('DB_POOL_SIZE', 10))),
-    queueLimit: Number(envValue('DB_QUEUE_LIMIT', 0)),
+    connectionLimit: Math.max(1, parseNumber(envValue('DB_POOL_SIZE', 10), 10)),
+    queueLimit: parseNumber(envValue('DB_QUEUE_LIMIT', 0), 0),
     enableKeepAlive: true,
     keepAliveInitialDelay: 10000,
-    connectTimeout: Number(envValue('DB_CONNECT_TIMEOUT_MS', 10000)),
+    connectTimeout: parseNumber(envValue('DB_CONNECT_TIMEOUT_MS', 10000), 10000),
     dateStrings: false,
     timezone: 'Z',
     ssl: enableSSL ? { rejectUnauthorized: false } : undefined,
@@ -193,7 +222,13 @@ async function ensurePool() {
   } catch (error) {
     pool = null;
     poolVerified = false;
-    logError('initial connection failed', error);
+    const config = buildPoolConfig();
+    logError('initial connection failed', error, {
+      host: config.host,
+      port: config.port,
+      database: config.database,
+      user: config.user,
+    });
     throw normalizeDatabaseError(error, 'Database connection failed');
   } finally {
     initializingPromise = null;
