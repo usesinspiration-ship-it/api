@@ -371,7 +371,7 @@ function buildRelevanceExpr(parsed, useFullText) {
       CASE WHEN LOWER(COALESCE(raw_content, '')) LIKE ? THEN 3 ELSE 0 END
     )`);
 
-    params.push(term, like, like, like, like, like, like);
+    params.push(term, like, like, like, like, like, like, like);
   }
 
   if (useFullText && parsed.fullTextBoolean) {

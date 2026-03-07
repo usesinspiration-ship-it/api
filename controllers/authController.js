@@ -146,6 +146,7 @@ async function register(req, res, next) {
       message: 'User registered successfully',
       user: {
         id: result.insertId,
+        name: name.trim(),
         email: normalizedEmail,
         role: normalizedRole,
       },
@@ -199,6 +200,7 @@ async function login(req, res, next) {
       expiresIn: tokens.expiresIn,
       user: {
         id: user.id,
+        name: user.name,
         email: user.email,
         role: user.role,
       },
@@ -304,7 +306,7 @@ async function logout(req, res, next) {
 async function getMe(req, res, next) {
   try {
     const user = await queryOne(
-      'SELECT id, email, role, DATE(created_at) AS createdAt FROM users WHERE id = ? LIMIT 1',
+      'SELECT id, name, email, role, DATE(created_at) AS createdAt FROM users WHERE id = ? LIMIT 1',
       [req.user.id]
     );
 
