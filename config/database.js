@@ -716,6 +716,7 @@ async function initializeDatabase() {
       education VARCHAR(255) NULL,
       experience_years INT NULL,
       file_size BIGINT UNSIGNED NULL,
+      file_url VARCHAR(1000) NULL,
       raw_content LONGTEXT NULL,
       created_by INT UNSIGNED NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -745,6 +746,7 @@ async function initializeDatabase() {
       education VARCHAR(255) NULL,
       experience_years INT NULL,
       file_size BIGINT UNSIGNED NULL,
+      file_url VARCHAR(1000) NULL,
       raw_content LONGTEXT NULL,
       created_by INT UNSIGNED NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -765,6 +767,7 @@ async function initializeDatabase() {
   await runSchemaQuery('ALTER TABLE cvs ADD COLUMN education VARCHAR(255) NULL');
   await runSchemaQuery('ALTER TABLE cvs ADD COLUMN experience_years INT NULL');
   await runSchemaQuery('ALTER TABLE cvs ADD COLUMN file_size BIGINT UNSIGNED NULL');
+  await runSchemaQuery('ALTER TABLE cvs ADD COLUMN file_url VARCHAR(1000) NULL');
   await runSchemaQuery('CREATE INDEX idx_cvs_education ON cvs(education)');
   await runSchemaQuery('CREATE INDEX idx_cvs_experience_years ON cvs(experience_years)');
   await runSchemaQuery('CREATE INDEX idx_cvs_file_size ON cvs(file_size)');

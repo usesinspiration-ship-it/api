@@ -2,6 +2,7 @@ const express = require('express');
 const {
   getAllCVs,
   getCVById,
+  downloadCV,
   createCV,
   updateCV,
   deleteCV,
@@ -24,6 +25,7 @@ const router = express.Router();
 // Global CV APIs are protected by JWT.
 router.get('/cvs', verifyToken, requireRole('admin', 'hr', 'recruiter', 'viewer'), getAllCVs);
 router.get('/cvs/:id', verifyToken, requireRole('admin', 'hr', 'recruiter', 'viewer'), getCVById);
+router.get('/cvs/:id/download', verifyToken, requireRole('admin', 'hr', 'recruiter', 'viewer'), downloadCV);
 router.post('/cvs', verifyToken, requireRole('admin', 'hr'), uploadSingleCV, validateAndProcessUpload, createCV);
 router.put('/cvs/:id', verifyToken, requireRole('admin', 'hr'), updateCV);
 router.delete('/cvs/:id', verifyToken, requireRole('admin', 'hr'), deleteCV);

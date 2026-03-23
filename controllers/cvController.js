@@ -1,4 +1,5 @@
 const { getPool } = require('../config/database');
+const { uploadToR2, deleteFromR2, getR2SignedUrl } = require('../utils/r2Storage');
 const { runAdvancedSearch, clearSearchCache, getSearchAnalytics } = require('../utils/searchHelper');
 const { extractCVFields } = require('../utils/cvExtractor');
 const { formatFileSize } = require('../utils/fileUpload');
@@ -197,6 +198,7 @@ function mapCvRow(row) {
     education: row.education || null,
     experienceYears: row.experience_years ?? null,
     fileSize: row.file_size ?? null,
+    fileUrl: row.file_url ?? null,
     rawContent: row.raw_content,
     createdBy: row.created_by,
     createdAt: row.created_at,
@@ -228,7 +230,7 @@ async function getAllCVs(req, res, next) {
              CAST(skills AS CHAR) AS skills,
              CAST(job_titles AS CHAR) AS job_titles,
              CAST(languages AS CHAR) AS languages,
-             education, experience_years, file_size,
+             education, experience_years, file_size, file_url,
              raw_content, created_by, created_at, updated_at
       FROM cvs
       ORDER BY updated_at DESC
@@ -266,7 +268,7 @@ async function getCVById(req, res, next) {
              CAST(skills AS CHAR) AS skills,
              CAST(job_titles AS CHAR) AS job_titles,
              CAST(languages AS CHAR) AS languages,
-             education, experience_years, file_size,
+             education, experience_years, file_size, file_url,
              raw_content, created_by, created_at, updated_at
       FROM cvs
       WHERE id = ?
@@ -328,11 +330,16 @@ async function createCV(req, res, next) {
     const fileSize = parseOptionalNonNegativeInt(req.body.fileSize, 'fileSize') ?? req.uploadData?.fileSize ?? null;
     const normalizedRawContent = rawContent || null;
 
+    let fileUrl = null;
+    if (hasUpload && req.file) {
+      fileUrl = await uploadToR2(req.file.buffer, req.file.originalname, req.file.mimetype);
+    }
+
     const pool = getPool();
     const [result] = await pool.query(
       `
-      INSERT INTO cvs (filename, email, phone, skills, job_titles, languages, education, experience_years, file_size, raw_content, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO cvs (filename, email, phone, skills, job_titles, languages, education, experience_years, file_size, file_url, raw_content, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         filename.trim(),
@@ -344,6 +351,7 @@ async function createCV(req, res, next) {
         education,
         experienceYears,
         fileSize,
+        fileUrl,
         normalizedRawContent,
         req.user.id,
       ]
@@ -355,7 +363,7 @@ async function createCV(req, res, next) {
              CAST(skills AS CHAR) AS skills,
              CAST(job_titles AS CHAR) AS job_titles,
              CAST(languages AS CHAR) AS languages,
-             education, experience_years, file_size,
+             education, experience_years, file_size, file_url,
              raw_content, created_by, created_at, updated_at
       FROM cvs
       WHERE id = ?
@@ -374,6 +382,7 @@ async function createCV(req, res, next) {
         id: created.id,
         name: created.filename,
         size: formatFileSize(created.fileSize || 0),
+        url: created.fileUrl,
         uploadDate: toUploadDate(created.createdAt),
         fields: {
           email: created.email,
@@ -493,7 +502,7 @@ async function updateCV(req, res, next) {
              CAST(skills AS CHAR) AS skills,
              CAST(job_titles AS CHAR) AS job_titles,
              CAST(languages AS CHAR) AS languages,
-             education, experience_years, file_size,
+             education, experience_years, file_size, file_url,
              raw_content, created_by, created_at, updated_at
       FROM cvs
       WHERE id = ?
@@ -519,24 +528,24 @@ async function deleteCV(req, res, next) {
     const id = parseCvId(req.params.id);
     const pool = getPool();
 
-    if (req.user.role !== 'admin') {
-      const [ownershipRows] = await pool.query('SELECT created_by FROM cvs WHERE id = ? LIMIT 1', [id]);
-      if (ownershipRows.length === 0) {
-        throw createError(404, 'Not Found', 'CV not found');
-      }
-      if (Number(ownershipRows[0].created_by || 0) !== Number(req.user.id)) {
-        throw createError(403, 'Forbidden', 'You can delete only your own CVs');
-      }
+    const [existingRows] = await pool.query('SELECT created_by, file_url FROM cvs WHERE id = ? LIMIT 1', [id]);
+    if (existingRows.length === 0) {
+      throw createError(404, 'Not Found', 'CV not found');
     }
 
-    let result;
-    if (req.user.role === 'admin') {
-      [result] = await pool.query('DELETE FROM cvs WHERE id = ?', [id]);
-    } else {
-      [result] = await pool.query('DELETE FROM cvs WHERE id = ? AND created_by = ?', [id, req.user.id]);
+    if (req.user.role !== 'admin' && Number(existingRows[0].created_by || 0) !== Number(req.user.id)) {
+      throw createError(403, 'Forbidden', 'You can delete only your own CVs');
     }
+
+    const fileUrlToDelete = existingRows[0].file_url;
+
+    const [result] = await pool.query('DELETE FROM cvs WHERE id = ?', [id]);
     if (result.affectedRows === 0) {
       throw createError(404, 'Not Found', 'CV not found');
+    }
+
+    if (fileUrlToDelete) {
+      await deleteFromR2(fileUrlToDelete);
     }
 
     clearSearchCache();
@@ -658,9 +667,32 @@ async function getUsersStats(req, res, next) {
   }
 }
 
+async function downloadCV(req, res, next) {
+  try {
+    const id = parseCvId(req.params.id);
+    const pool = getPool();
+    const [rows] = await pool.query('SELECT file_url FROM cvs WHERE id = ? LIMIT 1', [id]);
+    if (rows.length === 0) {
+      throw createError(404, 'Not Found', 'CV not found');
+    }
+    const fileUrl = rows[0].file_url;
+    if (!fileUrl) {
+      throw createError(404, 'Not Found', 'No file attached to this CV');
+    }
+    const signedUrl = await getR2SignedUrl(fileUrl);
+    if (!signedUrl) {
+       throw createError(500, 'Server Error', 'Failed to generate download URL');
+    }
+    return res.status(200).json({ url: signedUrl });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   getAllCVs,
   getCVById,
+  downloadCV,
   createCV,
   updateCV,
   deleteCV,
