@@ -104,11 +104,22 @@ app.post('/api/cvs/upload', authenticate, upload.single('file'), async (req, res
 
         // 2. Save to Database
         const [result] = await pool.execute(
-            'INSERT INTO cvs (filename, file_url, created_by) VALUES (?, ?, ?)',
-            [fileName, fileName, req.user.id]
+            'INSERT INTO cvs (filename, file_url, file_size, created_by) VALUES (?, ?, ?, ?)',
+            [fileName, fileName, file.size, req.user.id]
         );
 
-        res.json({ success: true, cvId: result.insertId, fileName });
+        res.json({ 
+            success: true, 
+            cv: {
+              id: result.insertId,
+              name: fileName,
+              filename: fileName,
+              fileSize: file.size,
+              fileUrl: fileName,
+              createdAt: new Date().toISOString(),
+              fields: {} // Fields are currently empty in this simplified version
+            }
+        });
     } catch (error) {
         console.error("R2 Upload Error:", error);
         res.status(500).json({ error: error.message });
@@ -126,6 +137,89 @@ app.get('/api/cvs/:filename/url', authenticate, async (req, res) => {
         res.json({ success: true, url });
     } catch (error) {
         console.error("R2 Get URL Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- CV List Route ---
+app.get('/api/cvs', authenticate, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = parseInt(req.query.skip) || 0;
+        
+        const [rows] = await pool.execute(
+            `SELECT id, filename, file_url, created_at, 
+             email, phone, skills, job_titles, languages, education, experience_years, file_size, raw_content
+             FROM cvs ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+            [limit, skip]
+        );
+
+        const [countResult] = await pool.execute('SELECT COUNT(*) as total FROM cvs');
+        
+        // Map to frontend-friendly format if needed, but currently frontend maps it in cv-list-service.ts
+        res.json({ 
+            success: true, 
+            data: rows,
+            pagination: { total: countResult[0].total, limit, skip }
+        });
+    } catch (error) {
+        console.error("Fetch CVs Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- CV Detail Route ---
+app.get('/api/cvs/:id', authenticate, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT * FROM cvs WHERE id = ?', [req.params.id]);
+        if (rows.length === 0) return res.status(404).json({ error: "CV not found" });
+        res.json({ success: true, data: rows[0] });
+    } catch (error) {
+        console.error("Fetch CV Detail Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- CV Delete Route ---
+app.delete('/api/cvs/:id', authenticate, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT file_url FROM cvs WHERE id = ?', [req.params.id]);
+        if (rows.length === 0) return res.status(404).json({ error: "CV not found" });
+
+        const fileUrl = rows[0].file_url;
+        if (fileUrl) {
+            const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+            await s3Client.send(new DeleteObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: fileUrl,
+            }));
+        }
+
+        await pool.execute('DELETE FROM cvs WHERE id = ?', [req.params.id]);
+        res.json({ success: true, message: "CV deleted successfully" });
+    } catch (error) {
+        console.error("Delete CV Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- Dashboard Stats Route ---
+app.get('/api/stats', authenticate, async (req, res) => {
+    try {
+        const [totalRows] = await pool.execute('SELECT COUNT(*) as total, SUM(file_size) as totalStorage FROM cvs');
+        const [lastUploadRows] = await pool.execute('SELECT created_at FROM cvs ORDER BY created_at DESC LIMIT 1');
+
+        res.json({
+            success: true,
+            total: totalRows[0].total,
+            overview: {
+                totalStorage: totalRows[0].totalStorage || 0,
+                avgFileSize: totalRows[0].total ? Math.round(totalRows[0].totalStorage / totalRows[0].total) : 0,
+                lastUploadDate: lastUploadRows[0]?.created_at || null
+            }
+        });
+    } catch (error) {
+        console.error("Stats Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
