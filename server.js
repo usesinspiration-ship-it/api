@@ -24,7 +24,8 @@ const pool = mysql.createPool({
     database: process.env.DB_NAME,
     waitForConnections: true,
     connectionLimit: 10,
-    queueLimit: 0
+    queueLimit: 0,
+    connectTimeout: 10000 // 10 seconds timeout
 });
 
 async function initializeDatabase() {
@@ -356,8 +357,8 @@ app.get('/api/status', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-initializeDatabase().then(() => {
-    app.listen(PORT, () => {
-        console.log(`🚀 Simplified Server running on port ${PORT}`);
-    });
+app.listen(PORT, () => {
+    console.log(`🚀 Simplified Server running on port ${PORT}`);
+    // Initialize DB in background
+    initializeDatabase();
 });
