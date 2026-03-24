@@ -6,7 +6,10 @@ const multer = require('multer');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+console.log("--- STARTING SERVER ---");
+console.log("Node version:", process.version);
 require('dotenv').config();
+console.log("Environment variables loaded");
 
 const app = express();
 
@@ -357,8 +360,15 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Simplified Server running on port ${PORT}`);
-    // Initialize DB in background
-    initializeDatabase();
+    console.log(`Health check: http://localhost:${PORT}/api/status`);
+    
+    // Initialize DB in background WITH A TIMEOUT
+    console.log("Starting DB initialization...");
+    initializeDatabase().then(() => {
+        console.log("DB Initialization complete");
+    }).catch(err => {
+        console.error("DB Initialization background error:", err.message);
+    });
 });
