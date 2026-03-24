@@ -3,87 +3,56 @@ const mysql = require('mysql2/promise');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const multer = require('multer');
-const admin = require('firebase-admin');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
+
+// 1. CORS - MUST be first
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+    exposedHeaders: ['Access-Control-Allow-Origin'],
 }));
+
+// 2. Body Parsers
 app.use(express.json());
-
-// --- Firebase Configuration ---
-// Expecting FIREBASE_SERVICE_ACCOUNT as a JSON string in .env or Railway variables
-try {
-    const saVar = process.env.FIREBASE_SERVICE_ACCOUNT;
-    let serviceAccount;
-
-    if (saVar) {
-        serviceAccount = JSON.parse(saVar);
-    } else {
-        const fs = require('fs');
-        const path = require('path');
-        const saPath = path.join(__dirname, 'firebase-service-account.json');
-        if (fs.existsSync(saPath)) {
-            serviceAccount = JSON.parse(fs.readFileSync(saPath, 'utf8'));
-            console.log("✅ Firebase Admin initialized from local file");
-        }
-    }
-
-    if (serviceAccount) {
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log("✅ Firebase Admin initialized");
-    } else {
-        console.warn("⚠️ Firebase Service Account not found (Env or File)");
-    }
-} catch (error) {
-    console.error("❌ Firebase Initialization Error:", error.message);
-}
 
 // --- Database Configuration ---
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
+    port: process.env.DB_PORT || 3306,
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
     database: process.env.DB_NAME,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
-    connectTimeout: 10000 // 10 seconds timeout
+    connectTimeout: 10000 
 });
 
 async function initializeDatabase() {
     try {
-        // Test connection
         const connection = await pool.getConnection();
         console.log("✅ Database connection successful");
-        connection.release();
-
-        await pool.execute(`
+        
+        await connection.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-                firebase_uid VARCHAR(128) NOT NULL,
                 name VARCHAR(120) NOT NULL,
                 email VARCHAR(255) NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
                 role ENUM('admin','hr','recruiter','viewer') NOT NULL DEFAULT 'viewer',
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
-                UNIQUE KEY uq_users_firebase_uid (firebase_uid),
                 UNIQUE KEY uq_users_email (email)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
 
-        // Migration: Update created_by to VARCHAR(128) to store Firebase UIDs
-        await pool.execute(`
-            ALTER TABLE cvs MODIFY COLUMN created_by VARCHAR(128) NULL
-        `);
-
-        await pool.execute(`
+        await connection.execute(`
             CREATE TABLE IF NOT EXISTS cvs (
                 id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
                 filename VARCHAR(255) NOT NULL,
@@ -97,17 +66,27 @@ async function initializeDatabase() {
                 file_size BIGINT UNSIGNED NULL,
                 file_url VARCHAR(1000) NULL,
                 raw_content LONGTEXT NULL,
-                created_by VARCHAR(128) NULL,
+                created_by INT UNSIGNED NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
                 KEY idx_cvs_created_by (created_by)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
         console.log("✅ Database tables verified/created");
+        connection.release();
     } catch (error) {
         console.error("❌ Database initialization failed:", error.message);
     }
 }
+
+
+// Process-level error handling to prevent silent crashes
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL: Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('CRITICAL: Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
 // --- R2 Configuration (Referencing donationreceipt) ---
 const s3Client = new S3Client({
@@ -122,30 +101,98 @@ const s3Client = new S3Client({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// --- Auth Middleware (Firebase) ---
+// --- Auth Middleware (JWT) ---
 const authenticate = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        console.warn("Auth failed: No Bearer token");
         return res.status(401).json({ error: "Unauthorized: No token provided" });
     }
 
-    const idToken = authHeader.split('Bearer ')[1];
+    const token = authHeader.split('Bearer ')[1];
     try {
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        req.user = {
-            id: decodedToken.uid,
-            email: decodedToken.email,
-            name: decodedToken.name || decodedToken.email.split('@')[0]
-        };
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        req.user = jwt.verify(token, secret);
         next();
     } catch (error) {
-        console.error("Firebase Auth Error:", error.message);
+        console.error("JWT Auth Error:", error.message);
         res.status(401).json({ error: "Unauthorized: Invalid or expired token" });
     }
 };
 
 // --- Auth Routes ---
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { email, password, name } = req.body;
+        if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const [result] = await pool.execute(
+            'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)',
+            [email, hashedPassword, name || 'User', 'viewer']
+        );
+
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const user = { id: result.insertId, email, name: name || 'User' };
+        const accessToken = jwt.sign(user, secret, { expiresIn: '7d' });
+        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
+
+        res.status(201).json({ 
+            success: true, 
+            accessToken, 
+            refreshToken,
+            expiresIn: 604800,
+            user 
+        });
+    } catch (error) {
+        console.error("Registration Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+        const user = rows[0];
+
+        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const accessToken = jwt.sign({ id: user.id, email: user.email, name: user.name }, secret, { expiresIn: '7d' });
+        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
+
+        res.json({ 
+            success: true, 
+            accessToken, 
+            refreshToken,
+            expiresIn: 604800,
+            user: { id: user.id, email: user.email, name: user.name } 
+        });
+    } catch (error) {
+        console.error("Login Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: "No refresh token" });
+    try {
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const decoded = jwt.verify(refreshToken, secret);
+        const newAccessToken = jwt.sign({ id: decoded.id }, secret, { expiresIn: '7d' });
+        res.json({ success: true, accessToken: newAccessToken });
+    } catch (e) {
+        res.status(401).json({ error: "Invalid refresh token" });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    res.json({ success: true, message: "Logged out" });
+});
+
 app.get('/api/auth/me', authenticate, (req, res) => {
     res.json({ success: true, user: req.user });
 });
@@ -301,6 +348,12 @@ app.get('/api/stats/:type', authenticate, (req, res) => {
 // --- Health Check ---
 app.get('/api/status', (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// --- Global Error Handling (Must be last) ---
+app.use((err, req, res, next) => {
+    console.error("Unhandled Error:", err);
+    res.status(500).json({ error: "Internal Server Error", details: err.message });
 });
 
 const PORT = process.env.PORT || 3000;
