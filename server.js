@@ -9,7 +9,11 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 
 // --- Database Configuration ---
@@ -22,6 +26,47 @@ const pool = mysql.createPool({
     connectionLimit: 10,
     queueLimit: 0
 });
+
+async function initializeDatabase() {
+    try {
+        await pool.execute(`
+            CREATE TABLE IF NOT EXISTS users (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                name VARCHAR(120) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role ENUM('admin','hr','recruiter','viewer') NOT NULL DEFAULT 'viewer',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_users_email (email)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+
+        await pool.execute(`
+            CREATE TABLE IF NOT EXISTS cvs (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                filename VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NULL,
+                phone VARCHAR(50) NULL,
+                skills JSON NULL,
+                job_titles JSON NULL,
+                languages JSON NULL,
+                education VARCHAR(255) NULL,
+                experience_years INT NULL,
+                file_size BIGINT UNSIGNED NULL,
+                file_url VARCHAR(1000) NULL,
+                raw_content LONGTEXT NULL,
+                created_by INT UNSIGNED NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_cvs_created_by (created_by)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+        console.log("✅ Database initialized");
+    } catch (error) {
+        console.error("❌ Database initialization failed:", error);
+    }
+}
 
 // --- R2 Configuration (Referencing donationreceipt) ---
 const s3Client = new S3Client({
@@ -75,12 +120,23 @@ app.post('/api/auth/login', async (req, res) => {
 
 // --- Auth Middleware ---
 const authenticate = (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        console.warn("Auth failed: No Authorization header");
+        return res.status(401).json({ error: "Unauthorized: No token provided" });
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+        console.warn("Auth failed: Malformed Authorization header");
+        return res.status(401).json({ error: "Unauthorized: Malformed token" });
+    }
+
     try {
         req.user = jwt.verify(token, process.env.JWT_SECRET);
         next();
     } catch (e) {
+        console.warn("Auth failed: Invalid or expired token", e.message);
         res.status(401).json({ error: "Invalid token" });
     }
 };
@@ -230,6 +286,8 @@ app.get('/api/status', (req, res) => {
 });
 
 const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Simplified Server running on port ${PORT}`);
+initializeDatabase().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 Simplified Server running on port ${PORT}`);
+    });
 });
