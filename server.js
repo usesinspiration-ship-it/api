@@ -18,14 +18,31 @@ app.use(express.json());
 // --- Firebase Configuration ---
 // Expecting FIREBASE_SERVICE_ACCOUNT as a JSON string in .env or Railway variables
 try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    console.log("✅ Firebase Admin initialized");
+    const saVar = process.env.FIREBASE_SERVICE_ACCOUNT;
+    let serviceAccount;
+
+    if (saVar) {
+        serviceAccount = JSON.parse(saVar);
+    } else {
+        const fs = require('fs');
+        const path = require('path');
+        const saPath = path.join(__dirname, 'firebase-service-account.json');
+        if (fs.existsSync(saPath)) {
+            serviceAccount = JSON.parse(fs.readFileSync(saPath, 'utf8'));
+            console.log("✅ Firebase Admin initialized from local file");
+        }
+    }
+
+    if (serviceAccount) {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log("✅ Firebase Admin initialized");
+    } else {
+        console.warn("⚠️ Firebase Service Account not found (Env or File)");
+    }
 } catch (error) {
-    console.error("❌ Firebase Initialization Warning:", error.message);
-    console.log("   Make sure FIREBASE_SERVICE_ACCOUNT env var is set.");
+    console.error("❌ Firebase Initialization Error:", error.message);
 }
 
 // --- Database Configuration ---
@@ -105,11 +122,6 @@ const s3Client = new S3Client({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// --- Auth Routes ---
-app.get('/api/auth/me', authenticate, (req, res) => {
-    res.json({ success: true, user: req.user });
-});
-
 // --- Auth Middleware (Firebase) ---
 const authenticate = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -132,6 +144,11 @@ const authenticate = async (req, res, next) => {
         res.status(401).json({ error: "Unauthorized: Invalid or expired token" });
     }
 };
+
+// --- Auth Routes ---
+app.get('/api/auth/me', authenticate, (req, res) => {
+    res.json({ success: true, user: req.user });
+});
 
 // --- CV Upload Route ---
 app.post('/api/cvs/upload', authenticate, upload.single('file'), async (req, res) => {
