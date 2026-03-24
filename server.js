@@ -3,8 +3,7 @@ const mysql = require('mysql2/promise');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const multer = require('multer');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const admin = require('firebase-admin');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -15,6 +14,19 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json());
+
+// --- Firebase Configuration ---
+// Expecting FIREBASE_SERVICE_ACCOUNT as a JSON string in .env or Railway variables
+try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("✅ Firebase Admin initialized");
+} catch (error) {
+    console.error("❌ Firebase Initialization Warning:", error.message);
+    console.log("   Make sure FIREBASE_SERVICE_ACCOUNT env var is set.");
+}
 
 // --- Database Configuration ---
 const pool = mysql.createPool({
@@ -38,14 +50,20 @@ async function initializeDatabase() {
         await pool.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                firebase_uid VARCHAR(128) NOT NULL,
                 name VARCHAR(120) NOT NULL,
                 email VARCHAR(255) NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
                 role ENUM('admin','hr','recruiter','viewer') NOT NULL DEFAULT 'viewer',
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
+                UNIQUE KEY uq_users_firebase_uid (firebase_uid),
                 UNIQUE KEY uq_users_email (email)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+
+        // Migration: Update created_by to VARCHAR(128) to store Firebase UIDs
+        await pool.execute(`
+            ALTER TABLE cvs MODIFY COLUMN created_by VARCHAR(128) NULL
         `);
 
         await pool.execute(`
@@ -62,7 +80,7 @@ async function initializeDatabase() {
                 file_size BIGINT UNSIGNED NULL,
                 file_url VARCHAR(1000) NULL,
                 raw_content LONGTEXT NULL,
-                created_by INT UNSIGNED NULL,
+                created_by VARCHAR(128) NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
                 KEY idx_cvs_created_by (created_by)
@@ -71,11 +89,6 @@ async function initializeDatabase() {
         console.log("✅ Database tables verified/created");
     } catch (error) {
         console.error("❌ Database initialization failed:", error.message);
-        if (error.code === 'ECONNREFUSED') {
-            console.error("   Check if DB_HOST and DB_PORT are correct and accessible.");
-        } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
-            console.error("   Check if DB_USER and DB_PASS are correct.");
-        }
     }
 }
 
@@ -93,113 +106,30 @@ const s3Client = new S3Client({
 const upload = multer({ storage: multer.memoryStorage() });
 
 // --- Auth Routes ---
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { email, password, name } = req.body;
-        if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const [result] = await pool.execute(
-            'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)',
-            [email, hashedPassword, name || 'User', 'viewer']
-        );
-
-        const secret = process.env.JWT_SECRET || 'your_secret_key';
-        const user = { id: result.insertId, email, name: name || 'User' };
-        const accessToken = jwt.sign(user, secret, { expiresIn: '7d' });
-        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
-
-        res.status(201).json({ 
-            success: true, 
-            accessToken, 
-            refreshToken,
-            expiresIn: 604800,
-            user 
-        });
-    } catch (error) {
-        console.error("Registration Error:", error);
-        res.status(500).json({ error: error.message });
-    }
+app.get('/api/auth/me', authenticate, (req, res) => {
+    res.json({ success: true, user: req.user });
 });
 
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
-        const user = rows[0];
-
-        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-            return res.status(401).json({ error: "Invalid credentials" });
-        }
-
-        const secret = process.env.JWT_SECRET || 'your_secret_key';
-        const accessToken = jwt.sign({ id: user.id, email: user.email, name: user.name }, secret, { expiresIn: '7d' });
-        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
-
-        res.json({ 
-            success: true, 
-            accessToken, 
-            refreshToken,
-            expiresIn: 604800,
-            user: { id: user.id, email: user.email, name: user.name } 
-        });
-    } catch (error) {
-        console.error("Login Error Details:", {
-            message: error.message,
-            code: error.code,
-            stack: error.stack
-        });
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
-    }
-});
-
-app.post('/api/auth/refresh', async (req, res) => {
-    const { refreshToken } = req.body;
-    if (!refreshToken) return res.status(400).json({ error: "No refresh token" });
-    try {
-        const secret = process.env.JWT_SECRET || 'your_secret_key';
-        const decoded = jwt.verify(refreshToken, secret);
-        const newAccessToken = jwt.sign({ id: decoded.id }, secret, { expiresIn: '7d' });
-        res.json({ success: true, accessToken: newAccessToken });
-    } catch (e) {
-        res.status(401).json({ error: "Invalid refresh token" });
-    }
-});
-
-app.post('/api/auth/logout', (req, res) => {
-    res.json({ success: true, message: "Logged out" });
-});
-
-app.get('/api/auth/me', authenticate, async (req, res) => {
-    try {
-        const [rows] = await pool.execute('SELECT id, email, name FROM users WHERE id = ?', [req.user.id]);
-        if (rows.length === 0) return res.status(404).json({ error: "User not found" });
-        res.json({ success: true, user: rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// --- Auth Middleware ---
-const authenticate = (req, res, next) => {
+// --- Auth Middleware (Firebase) ---
+const authenticate = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) {
-        console.warn("Auth failed: No Authorization header");
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        console.warn("Auth failed: No Bearer token");
         return res.status(401).json({ error: "Unauthorized: No token provided" });
     }
 
-    const token = authHeader.split(' ')[1];
-    if (!token) {
-        console.warn("Auth failed: Malformed Authorization header");
-        return res.status(401).json({ error: "Unauthorized: Malformed token" });
-    }
-
+    const idToken = authHeader.split('Bearer ')[1];
     try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        req.user = {
+            id: decodedToken.uid,
+            email: decodedToken.email,
+            name: decodedToken.name || decodedToken.email.split('@')[0]
+        };
         next();
-    } catch (e) {
-        console.warn("Auth failed: Invalid or expired token", e.message);
-        res.status(401).json({ error: "Invalid token" });
+    } catch (error) {
+        console.error("Firebase Auth Error:", error.message);
+        res.status(401).json({ error: "Unauthorized: Invalid or expired token" });
     }
 };
 
@@ -220,7 +150,7 @@ app.post('/api/cvs/upload', authenticate, upload.single('file'), async (req, res
         });
         await s3Client.send(command);
 
-        // 2. Save to Database
+        // 2. Save to Database (using Firebase UID)
         const [result] = await pool.execute(
             'INSERT INTO cvs (filename, file_url, file_size, created_by) VALUES (?, ?, ?, ?)',
             [fileName, fileName, file.size, req.user.id]
@@ -235,7 +165,7 @@ app.post('/api/cvs/upload', authenticate, upload.single('file'), async (req, res
               fileSize: file.size,
               fileUrl: fileName,
               createdAt: new Date().toISOString(),
-              fields: {} // Fields are currently empty in this simplified version
+              fields: {}
             }
         });
     } catch (error) {
