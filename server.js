@@ -1,125 +1,141 @@
 const express = require('express');
+const mysql = require('mysql2/promise');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const multer = require('multer');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const dotenv = require('dotenv');
-
-dotenv.config();
-
-const cvRoutes = require('./routes/cv.routes');
-const authRoutes = require('./routes/auth.routes');
-const errorHandler = require('./middleware/errorHandler');
-const { NotFoundError } = require('./middleware/errorHandler');
-const requestLogger = require('./middleware/requestLogger');
-const logger = require('./utils/logger');
-const { testConnection, initializeDatabase, closePool } = require('./config/database');
-const { ensureSearchIndexes } = require('./utils/searchHelper');
-const { ensureStatsIndexes } = require('./utils/statsHelper');
+require('dotenv').config();
 
 const app = express();
-const pkg = require('./package.json');
+app.use(cors());
+app.use(express.json());
 
-app.disable('x-powered-by');
-
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || '*',
-    methods: ['GET', 'POST', 'DELETE', 'PUT', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-);
-
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(requestLogger);
-
-/**
- * GET /api/status
- * Example response:
- * {
- *   "status": "ok",
- *   "timestamp": "2026-03-05T07:00:00.000Z",
- *   "version": "1.0.0"
- * }
- */
-app.get('/api/status', async (req, res, next) => {
-  try {
-    await testConnection();
-    return res.status(200).json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      version: pkg.version,
-    });
-  } catch (error) {
-    return next({
-      status: 500,
-      message: 'Server Error',
-      details: `database check failed: ${error.message}`,
-    });
-  }
+// --- Database Configuration ---
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-app.use('/api/auth', authRoutes);
-app.use('/api', cvRoutes);
-
-app.use((req, res, next) => {
-  next(new NotFoundError(`Route ${req.method} ${req.originalUrl} does not exist`));
+// --- R2 Configuration (Referencing donationreceipt) ---
+const s3Client = new S3Client({
+    region: 'auto',
+    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+    },
+    forcePathStyle: true,
 });
 
-app.use(errorHandler);
+const upload = multer({ storage: multer.memoryStorage() });
 
-const PORT = Number(process.env.PORT || 3000);
-let server;
-let shuttingDown = false;
+// --- Auth Routes ---
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { email, password, name } = req.body;
+        if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-async function start() {
-  await testConnection();
-  await initializeDatabase();
-  await ensureSearchIndexes();
-  await ensureStatsIndexes();
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const [result] = await pool.execute(
+            'INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, ?)',
+            [email, hashedPassword, name || 'User', 'viewer']
+        );
 
-  server = app.listen(PORT, () => {
-    logger.info(`API server listening on port ${PORT}`, {
-      env: process.env.NODE_ENV || 'development',
-    });
-  });
-}
-
-async function shutdown(signal) {
-  if (shuttingDown) {
-    return;
-  }
-
-  shuttingDown = true;
-  logger.warn(`${signal} received. Starting graceful shutdown...`);
-
-  try {
-    if (server) {
-      await new Promise((resolve) => server.close(resolve));
+        res.status(201).json({ success: true, userId: result.insertId });
+    } catch (error) {
+        console.error("Registration Error:", error);
+        res.status(500).json({ error: error.message });
     }
-    await closePool();
-    logger.info('Shutdown complete.');
-    process.exit(0);
-  } catch (error) {
-    logger.error('Shutdown error', error);
-    process.exit(1);
-  }
-}
-
-process.on('SIGINT', () => {
-  shutdown('SIGINT');
 });
 
-process.on('SIGTERM', () => {
-  shutdown('SIGTERM');
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+        const user = rows[0];
+
+        if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+
+        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
+        res.json({ success: true, token, user: { id: user.id, email: user.email, name: user.name } });
+    } catch (error) {
+        console.error("Login Error:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-process.on('unhandledRejection', (error) => {
-  logger.error('Unhandled promise rejection', error);
-  shutdown('unhandledRejection');
+// --- Auth Middleware ---
+const authenticate = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    try {
+        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        next();
+    } catch (e) {
+        res.status(401).json({ error: "Invalid token" });
+    }
+};
+
+// --- CV Upload Route ---
+app.post('/api/cvs/upload', authenticate, upload.single('file'), async (req, res) => {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+    const fileName = `${Date.now()}_${file.originalname}`;
+    
+    try {
+        // 1. Upload to R2
+        const command = new PutObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: fileName,
+            Body: file.buffer,
+            ContentType: file.mimetype,
+        });
+        await s3Client.send(command);
+
+        // 2. Save to Database
+        const [result] = await pool.execute(
+            'INSERT INTO cvs (filename, file_url, created_by) VALUES (?, ?, ?)',
+            [fileName, fileName, req.user.id]
+        );
+
+        res.json({ success: true, cvId: result.insertId, fileName });
+    } catch (error) {
+        console.error("R2 Upload Error:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-start().catch((error) => {
-  logger.error('Startup failed', error);
-  process.exit(1);
+// --- Get Signed URL Route ---
+app.get('/api/cvs/:filename/url', authenticate, async (req, res) => {
+    try {
+        const command = new GetObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: req.params.filename,
+        });
+        const url = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+        res.json({ success: true, url });
+    } catch (error) {
+        console.error("R2 Get URL Error:", error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-module.exports = app;
+// --- Health Check ---
+app.get('/api/status', (req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Simplified Server running on port ${PORT}`);
+});

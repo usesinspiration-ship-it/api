@@ -10,7 +10,6 @@ const bucketName = (process.env.R2_BUCKET_NAME || '').trim();
 const s3Client = new S3Client({
   region: 'auto',
   endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-  forcePathStyle: true,
   credentials: {
     accessKeyId,
     secretAccessKey,
