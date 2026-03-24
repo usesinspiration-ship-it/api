@@ -29,6 +29,11 @@ const pool = mysql.createPool({
 
 async function initializeDatabase() {
     try {
+        // Test connection
+        const connection = await pool.getConnection();
+        console.log("✅ Database connection successful");
+        connection.release();
+
         await pool.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -62,9 +67,14 @@ async function initializeDatabase() {
                 KEY idx_cvs_created_by (created_by)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
-        console.log("✅ Database initialized");
+        console.log("✅ Database tables verified/created");
     } catch (error) {
-        console.error("❌ Database initialization failed:", error);
+        console.error("❌ Database initialization failed:", error.message);
+        if (error.code === 'ECONNREFUSED') {
+            console.error("   Check if DB_HOST and DB_PORT are correct and accessible.");
+        } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
+            console.error("   Check if DB_USER and DB_PASS are correct.");
+        }
     }
 }
 
@@ -93,7 +103,18 @@ app.post('/api/auth/register', async (req, res) => {
             [email, hashedPassword, name || 'User', 'viewer']
         );
 
-        res.status(201).json({ success: true, userId: result.insertId });
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const user = { id: result.insertId, email, name: name || 'User' };
+        const accessToken = jwt.sign(user, secret, { expiresIn: '7d' });
+        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
+
+        res.status(201).json({ 
+            success: true, 
+            accessToken, 
+            refreshToken,
+            expiresIn: 604800,
+            user 
+        });
     } catch (error) {
         console.error("Registration Error:", error);
         res.status(500).json({ error: error.message });
@@ -110,10 +131,50 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ error: "Invalid credentials" });
         }
 
-        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-        res.json({ success: true, token, user: { id: user.id, email: user.email, name: user.name } });
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const accessToken = jwt.sign({ id: user.id, email: user.email, name: user.name }, secret, { expiresIn: '7d' });
+        const refreshToken = jwt.sign({ id: user.id }, secret, { expiresIn: '30d' });
+
+        res.json({ 
+            success: true, 
+            accessToken, 
+            refreshToken,
+            expiresIn: 604800,
+            user: { id: user.id, email: user.email, name: user.name } 
+        });
     } catch (error) {
-        console.error("Login Error:", error);
+        console.error("Login Error Details:", {
+            message: error.message,
+            code: error.code,
+            stack: error.stack
+        });
+        res.status(500).json({ error: "Internal Server Error", details: error.message });
+    }
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: "No refresh token" });
+    try {
+        const secret = process.env.JWT_SECRET || 'your_secret_key';
+        const decoded = jwt.verify(refreshToken, secret);
+        const newAccessToken = jwt.sign({ id: decoded.id }, secret, { expiresIn: '7d' });
+        res.json({ success: true, accessToken: newAccessToken });
+    } catch (e) {
+        res.status(401).json({ error: "Invalid refresh token" });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    res.json({ success: true, message: "Logged out" });
+});
+
+app.get('/api/auth/me', authenticate, async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT id, email, name FROM users WHERE id = ?', [req.user.id]);
+        if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+        res.json({ success: true, user: rows[0] });
+    } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
@@ -280,12 +341,21 @@ app.get('/api/stats', authenticate, async (req, res) => {
     }
 });
 
+// --- Dummy Search & Detailed Stats (To prevent Frontend errors) ---
+app.get('/api/search', authenticate, (req, res) => {
+    res.json({ success: true, data: [] });
+});
+
+app.get('/api/stats/:type', authenticate, (req, res) => {
+    res.json({ success: true, data: {} });
+});
+
 // --- Health Check ---
 app.get('/api/status', (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 initializeDatabase().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 Simplified Server running on port ${PORT}`);
